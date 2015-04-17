@@ -15,16 +15,24 @@
 package kafka
 
 import (
+	"bytes"
+	"encoding/gob"
 	"errors"
 	"fmt"
-	"github.com/Shopify/sarama"
-	"github.com/mozilla-services/heka/message"
-	"github.com/mozilla-services/heka/pipeline"
+	"io/ioutil"
 	"regexp"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/Shopify/sarama"
+	"github.com/mozilla-services/heka/message"
+	"github.com/mozilla-services/heka/pipeline"
+)
+
+var (
+	RetryBroker = errors.New("out of brokers, waiting to retry")
 )
 
 type KafkaOutputConfig struct {
@@ -40,6 +48,9 @@ type KafkaOutputConfig struct {
 	DialTimeout     uint32 `toml:"dial_timeout"`
 	ReadTimeout     uint32 `toml:"read_timeout"`
 	WriteTimeout    uint32 `toml:"write_timeout"`
+
+	DumpPath string `toml:"dump_path"`
+	RqsDebug int    `toml:"rqs_debug"`
 
 	// Producer Config
 	Partitioner string // Random, RoundRobin, Hash
@@ -65,6 +76,12 @@ type messageVariable struct {
 	name   string
 	fi     int
 	ai     int
+}
+
+type DumpStruct struct {
+	Topic string
+	Key   string
+	Msg   []byte
 }
 
 type KafkaOutput struct {
@@ -317,27 +334,62 @@ func (k *KafkaOutput) Run(or pipeline.OutputRunner, h pipeline.PluginHelper) (er
 	go k.processKafkaErrors(or, errChan, &wg)
 
 	var (
-		pack  *pipeline.PipelinePack
-		topic = k.config.Topic
-		key   sarama.Encoder
+		pack        *pipeline.PipelinePack
+		topic       = k.config.Topic
+		key         string
+		failRecords []*DumpStruct
+		failRecord  *DumpStruct
 	)
 
-	for pack = range inChan {
+	if err := k.restoreDump(or); err != nil {
+		or.LogError(err)
+	}
+
+	var processMsgNumPerSec int64
+	if k.config.RqsDebug == 1 {
+		go func() {
+			for _ = range time.Tick(time.Second) {
+				p := atomic.SwapInt64(&processMsgNumPerSec, 0)
+				or.LogMessage(fmt.Sprintf("rqs: %d", p))
+			}
+		}()
+	}
+
+wait:
+	for {
+		select {
+		case pack = <-inChan:
+			if pack == nil {
+				goto shutdown
+			}
+		case <-time.After(2 * time.Second):
+			if len(failRecords) > 0 {
+				failRecords = k.smartSendMessage(or, failRecords)
+			}
+			goto wait
+		}
 		atomic.AddInt64(&k.processMessageCount, 1)
+		atomic.AddInt64(&processMsgNumPerSec, 1)
 
 		if k.topicVariable != nil {
 			topic = getMessageVariable(pack.Message, k.topicVariable)
 		}
 		if k.hashVariable != nil {
-			key = sarama.StringEncoder(getMessageVariable(pack.Message, k.hashVariable))
+			key = getMessageVariable(pack.Message, k.hashVariable)
 		}
 
 		if msgBytes, err := or.Encode(pack); err == nil {
 			if msgBytes != nil {
-				err = k.producer.QueueMessage(topic, key, sarama.ByteEncoder(msgBytes))
-				if err != nil {
+				if len(failRecords) > 0 {
+					failRecords = append(failRecords, &DumpStruct{topic, key, msgBytes})
 					atomic.AddInt64(&k.processMessageFailures, 1)
-					or.LogError(err)
+					failRecords = k.smartSendMessage(or, failRecords)
+				} else {
+					failRecord = k.SendMessage(or, topic, key, msgBytes, false)
+					if failRecord != nil {
+						failRecords = append(failRecords, failRecord)
+						atomic.AddInt64(&k.processMessageFailures, 1)
+					}
 				}
 			} else {
 				atomic.AddInt64(&k.processMessageDiscards, 1)
@@ -348,9 +400,91 @@ func (k *KafkaOutput) Run(or pipeline.OutputRunner, h pipeline.PluginHelper) (er
 		}
 		pack.Recycle()
 	}
+shutdown:
+	if len(failRecords) > 0 {
+		k.dump(failRecords)
+	}
 	errChan <- Shutdown
 	wg.Wait()
 	return
+}
+
+func (k *KafkaOutput) smartSendMessage(or pipeline.OutputRunner, failRecords []*DumpStruct) []*DumpStruct {
+	var failRecord *DumpStruct
+	for len(failRecords) > 0 {
+		failRecord = failRecords[0]
+		failRecord = k.SendMessage(or, failRecord.Topic, failRecord.Key, failRecord.Msg, false)
+		if failRecord != nil {
+			break
+		}
+		atomic.AddInt64(&k.processMessageFailures, -1)
+		failRecords = failRecords[1:]
+	}
+	return failRecords
+}
+
+func (k *KafkaOutput) SendMessage(or pipeline.OutputRunner, topic, keyStr string, msgBytes []byte, wait bool) (failRecord *DumpStruct) {
+	var (
+		timeWait = 2 * time.Second
+		key      = sarama.ByteEncoder(keyStr)
+		encoder  = sarama.ByteEncoder(msgBytes)
+		err      error
+	)
+
+retry:
+	if err = k.producer.QueueMessage(topic, key, encoder); err == nil {
+		return nil
+	}
+
+	or.LogError(err)
+	atomic.AddInt64(&k.processMessageFailures, 1)
+	time.Sleep(timeWait)
+
+	if wait {
+		goto retry
+	}
+
+	return &DumpStruct{
+		Topic: topic,
+		Key:   keyStr,
+		Msg:   msgBytes,
+	}
+}
+
+func (k *KafkaOutput) dump(s []*DumpStruct) error {
+	if k.config.DumpPath == "" {
+		return nil
+	}
+
+	buf := bytes.NewBuffer(nil)
+	err := gob.NewEncoder(buf).Encode(s)
+	if err != nil {
+		return err
+	}
+
+	return ioutil.WriteFile(k.config.DumpPath, buf.Bytes(), 0666)
+}
+
+func (k *KafkaOutput) restoreDump(or pipeline.OutputRunner) error {
+	if k.config.DumpPath == "" {
+		return nil
+	}
+
+	dumpData, err := ioutil.ReadFile(k.config.DumpPath)
+	if err != nil {
+		return err
+	}
+
+	var dumps []*DumpStruct
+	err = gob.NewDecoder(bytes.NewReader(dumpData)).Decode(&dumps)
+	if err != nil {
+		return err
+	}
+
+	for _, dump := range dumps {
+		k.SendMessage(or, dump.Topic, dump.Key, dump.Msg, true)
+	}
+	return nil
 }
 
 func (k *KafkaOutput) ReportMsg(msg *message.Message) error {
